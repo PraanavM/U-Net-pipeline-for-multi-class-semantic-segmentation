@@ -1,0 +1,465 @@
+from keras.utils import to_categorical
+import os
+import cv2
+from PIL import Image
+import numpy as np
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from keras.optimizers import Adam
+from keras.models import save_model, load_model
+import tensorflow as tf
+from tensorflow.keras import backend as K
+import tensorflow.keras.metrics
+import glob
+from tqdm import tqdm
+from skimage.io import imread, imshow
+import random
+import copy
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from keras.models import Model
+from keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate, Conv2DTranspose, BatchNormalization, Dropout, Lambda
+from keras.layers import Concatenate, Activation, MaxPool2D
+from smoothener_v2 import predict_img_with_smooth_windowing
+from sklearn.metrics import confusion_matrix
+
+#Set U-Net input patch height, width, channels and number of classes
+IMG_HEIGHT = 128 
+IMG_WIDTH = 128
+IMG_CHANNELS = 3
+NUM_CLASSES = 4
+
+#Declare training and test/val images and mask paths. These paths must contain the patches
+#as created by the patcher program
+TRAIN_IMAGE_PATH = 'C:/'
+TRAIN_MASK_PATH = 'C:/'
+VAL_IMAGE_PATH = 'C:/'
+VAL_MASK_PATH = 'C:/'
+
+#get training and test/val names 
+train_ids = os.listdir(TRAIN_IMAGE_PATH)
+val_ids = os.listdir(VAL_IMAGE_PATH)
+
+train_images = []
+train_masks = []
+val_images = []
+val_masks = []
+
+#read train imgs
+for n, id_ in tqdm(enumerate(train_ids), total=len(train_ids)):
+    img_path = TRAIN_IMAGE_PATH + id_
+    img = imread(img_path, 0)[:, :None]
+    train_images.append(img)
+print("Train Images processed")
+train_images = np.array(train_images)
+print("size of array", train_images.shape)
+
+#read test/val imgs
+for n, id_ in tqdm(enumerate(val_ids), total=len(val_ids)):
+    val_img_path = VAL_IMAGE_PATH + id_
+    val_img = imread(val_img_path, 0)[:, :None]
+    val_images.append(val_img)
+print("Val Images processed")
+val_images = np.array(val_images)
+print("size of array", val_images.shape)
+
+#read train masks
+for n, id_ in tqdm(enumerate(train_ids), total=len(train_ids)):
+    mask_path = TRAIN_MASK_PATH + 'mask_' + id_ 
+    mask = imread(mask_path, as_gray=True)
+    train_masks.append(mask)
+print("Masks processed")
+train_masks= np.array(train_masks)
+print("size of array", train_masks.shape)
+
+#read test/val masks
+for n, id_ in tqdm(enumerate(val_ids), total=len(val_ids)):
+    val_mask_path = VAL_MASK_PATH + 'mask_' + id_
+    val_mask = imread(val_mask_path, as_gray=True)
+    val_masks.append(val_mask)
+print("Val Masks processed")
+val_masks = np.array(val_masks)
+print("size of array", val_masks.shape)
+
+#Used in sanity_check()
+all_imgs = np.concatenate([train_images,val_images]) 
+all_masks = np.concatenate([train_masks,val_masks])
+
+#Label encoding the masks
+print('Encoding mask data...')
+labelencoder = LabelEncoder()
+n_c, h, w = train_masks.shape
+n_cval, _, _ = val_masks.shape
+train_masks_reshaped = train_masks.reshape(-1,1)
+val_masks_reshaped = val_masks.reshape(-1,1)
+print("reshaped size:", train_masks_reshaped.shape)
+train_masks_reshaped = train_masks_reshaped.ravel()
+val_masks_reshaped = val_masks_reshaped.ravel()
+print("raveled size:", train_masks_reshaped.shape)
+train_masks_reshaped_encoded = labelencoder.fit_transform(train_masks_reshaped)
+val_masks_reshaped_encoded = labelencoder.fit_transform(val_masks_reshaped)
+print("encoded size:", train_masks_reshaped_encoded.shape)
+train_masks_encoded_original_shape = train_masks_reshaped_encoded.reshape(n_c, h, w)
+val_masks_encoded_original_shape = val_masks_reshaped_encoded.reshape(n_cval, h, w)
+np.unique(train_masks_encoded_original_shape)
+print('classes are:', np.unique(train_masks_encoded_original_shape))
+print('Done!')
+
+#Normalizing images to map [0,255] onto [-1,1]
+print('Normalizing mask data...')
+train_images = np.expand_dims(train_images, axis=3)
+val_images = np.expand_dims(val_images, axis=3)
+train_images = (train_images*0.008)-1 
+val_images = (val_images*0.008)-1
+train_masks_input = np.expand_dims(train_masks_encoded_original_shape, axis=3)
+val_masks_input = np.expand_dims(val_masks_encoded_original_shape, axis=3)
+print('Done!')
+
+print('Training Arrays processed!')
+print("Class values in the dataset are ... ", np.unique(train_masks_input), "of shape", train_masks_input.shape)
+
+#one-hot encoding
+train_masks_cat = to_categorical(train_masks_input, num_classes=NUM_CLASSES)
+val_masks_cat = to_categorical(val_masks_input, num_classes=NUM_CLASSES)
+train_masks_cat = train_masks_cat.reshape((train_masks_input.shape[0], train_masks_input.shape[1], train_masks_input.shape[2], NUM_CLASSES))
+val_masks_cat = val_masks_cat.reshape((val_masks_input.shape[0], val_masks_input.shape[1], val_masks_input.shape[2], NUM_CLASSES))                    
+train_images = train_images.reshape(n_c,128,128,3)
+val_images = val_images.reshape(n_cval,128,128,3)
+
+#Load X andy_train and X and y_test arays
+X_train = train_images
+y_train = train_masks_cat
+X_test = val_images
+y_test = val_masks_cat
+print("Arrays loaded!")
+print("Images and masks ready for training")
+
+def sanity_check():
+    '''Sanity check to ensure every 
+    image is lined up with its mask
+    '''
+    if len(train_images) == 0:  # Check if X_train is empty
+        print("X_train is empty. Please load the training images first.")
+        return
+    image_x = random.randint(0, len(all_imgs) - 1)  # Adjust upper bound to prevent out-of-bounds error
+    im = all_imgs[image_x]
+    ma = all_masks[image_x]
+    # Set up subplots
+    plt.figure(figsize=(10, 5))
+    # Original Image
+    plt.subplot(1, 2, 1)
+    plt.imshow(im)
+    plt.title('Original Image')
+    # Corresponding Mask
+    plt.subplot(1, 2, 2)
+    plt.imshow(np.squeeze(ma))
+    plt.title('Corresponding Mask')
+    plt.show()
+
+
+def weighted_categorical_crossentropy(class_weights):
+    """
+    Weighted categorical crossentropy loss function, 
+    original code sourced from:-
+    https://gist.github.com/onesamblack/06366fd99ff7db5914ec8292f272d390
+    Author: onesamblack, Created:Mar 31st 2021
+    """
+    weight = K.variable(class_weights)
+    def loss(y_true, y_pred):
+        y_pred /= K.sum(y_pred, axis=-1, keepdims=True)
+        # clip to prevent NaN's and Inf's
+        y_pred = K.clip(y_pred, K.epsilon(), 1 - K.epsilon())
+        # calc
+        loss = y_true * K.log(y_pred) * weight
+        loss = -K.sum(loss, -1)
+        return loss
+    return loss
+
+
+def multi_unet_model(n_classes=4, IMG_HEIGHT=128, IMG_WIDTH=128, IMG_CHANNELS=3):
+    '''Multi-class semantic segmentation U-Net architecture based on
+    DigitalSreeni's/Bnsreenu's Code:-
+    https://github.com/bnsreenu/python_for_microscopists/blob/master/208-simple_multi_unet_model.py
+    '''
+    #U-Net architecture
+    inputs = Input((IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS))
+    s = inputs
+
+    #Contraction path
+    c1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(s)
+    c1 = Dropout(0.1)(c1)
+    c1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c1)
+    p1 = MaxPooling2D((2, 2))(c1)
+    
+    c2 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p1)
+    c2 = Dropout(0.1)(c2)
+    c2 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c2)
+    p2 = MaxPooling2D((2, 2))(c2)
+
+    c3 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p2)
+    c3 = Dropout(0.2)(c3)
+    c3 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c3)
+    p3 = MaxPooling2D((2, 2))(c3)
+
+    c4 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p3)
+    c4 = Dropout(0.2)(c4)
+    c4 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c4)
+    p4 = MaxPooling2D(pool_size=(2, 2))(c4)
+
+    c5 = Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p4)
+    c5 = Dropout(0.3)(c5)
+    c5 = Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c5)
+    
+    #Expansive path 
+    u6 = Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c5)
+    u6 = concatenate([u6, c4])
+    c6 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u6)
+    c6 = Dropout(0.2)(c6)
+    c6 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c6)
+
+    u7 = Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c6)
+    u7 = concatenate([u7, c3])
+    c7 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u7)
+    c7 = Dropout(0.2)(c7)
+    c7 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c7)
+    
+    u8 = Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(c7)
+    u8 = concatenate([u8, c2])
+    c8 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u8)
+    c8 = Dropout(0.1)(c8)
+    c8 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c8)
+
+    u9 = Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(c8)
+    u9 = concatenate([u9, c1], axis=3)
+    c9 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u9)
+    c9 = Dropout(0.1)(c9)
+    c9 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c9)
+
+    outputs = Conv2D(n_classes, (1, 1), activation='softmax')(c9)
+    model = Model(inputs=[inputs], outputs=[outputs])
+    
+    #Set epochs, batch size, class weights and save model then fit.
+    epochs = 20
+    class_weights = np.array([0.175, 0.500, 0.175, 0.150]) #Ferrite, R.Austenite, Pearlite and Martensite in that order
+    model.compile(optimizer='adam', loss= weighted_categorical_crossentropy(class_weights), metrics=['accuracy'])
+    model.summary()
+    save_model(model, 'C:/') #save as .hdf5 file
+    history = model.fit(X_train, y_train, batch_size=8, shuffle=True, epochs=epochs, verbose=1, validation_data=(X_test, y_test))
+    
+    #Plot training and validation loss and accuracy at the end of training:-
+    loss = history.history['loss']
+    val_loss = history.history['val_loss']
+    epochs = range(1, len(loss) + 1)
+    plt.plot(epochs, loss, 'y', label='Training loss')
+    plt.plot(epochs, val_loss, 'r', label='Validation loss')
+    plt.title('Training and validation loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+    acc = history.history['acc']
+    val_acc = history.history['val_acc']
+    plt.plot(epochs, acc, 'y', label='Training Accuracy')
+    plt.plot(epochs, val_acc, 'r', label='Validation Accuracy')
+    plt.title('Training and validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.show()
+    return model
+
+
+def predict_results():
+    '''Make predictions patch-by-patch on train and test images
+    and saves to an output folder. Use the repatcher program after this to
+    recreate large images from the patches made here.
+    '''
+    input_folder_train = 'C:/'
+    input_folder_test = 'C:/'
+    output_folder = 'C:/'
+    model = load_model('C:/', compile=False)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    i = 0
+    file_list_train = os.listdir(input_folder_train)
+    file_list_test = os.listdir(input_folder_test)
+    #FIRST ON TRAIN IMGS:-
+    for i, (filename, input_data) in tqdm(enumerate(zip(file_list_train, train_images)), total=len(file_list_train)): 
+        filename = file_list_train[i] 
+        input_data = train_images[i]
+        input_data = np.expand_dims(input_data,0)
+        input_data = input_data.reshape(128,128,3)
+        input_data = np.expand_dims(input_data, axis=0)
+        prediction = model.predict(input_data)
+        prediction = np.squeeze(prediction)
+        prediction = np.argmax(prediction, axis=2)
+        result = np.zeros((128,128,3), dtype=np.uint8)
+        row,col = 1,1
+        for row in range(128):
+            for col in range(128):
+                cat = prediction[row, col]  # Get the index of the highest probability and recolour based on rgb channels
+                if cat == 0: #CHANNELS: BGR [0,1,2]
+                    result[row,col,2] = 0 #[Ferrite]
+                    result[row,col,1] = 0
+                    result[row,col,0] = 0
+                elif cat == 1:
+                    result[row,col,0] = 255 #[R.Austenite]
+                elif cat == 2:
+                    result[row,col,2] = 255 #[Pearlite]
+                else:
+                    result[row,col,1] = 255 #[Martensite]
+        mask_filename = 'mask_' + os.path.splitext(filename)[0] + '.png'
+        mask_path = os.path.join(output_folder, mask_filename)
+        cv2.imwrite(mask_path, result)
+    #NOW FOR TEST IMGS:-
+    for i, (filename, input_data) in tqdm(enumerate(zip(file_list_test, val_images)), total=len(file_list_test)): #for i in range(num_files):
+        filename = file_list_test[i] 
+        input_data = val_images[i]
+        input_data = np.expand_dims(input_data,0)
+        input_data = input_data.reshape(128,128,3)
+        input_data = np.expand_dims(input_data, axis=0)
+        prediction = model.predict(input_data)
+        prediction = np.squeeze(prediction)
+        prediction = np.argmax(prediction, axis=2)
+        result = np.zeros((128,128,3), dtype=np.uint8)
+        row,col = 1,1
+        for row in range(128):
+            for col in range(128):
+                cat = prediction[row, col]  # Get the index of the highest probability and recolour based on rgb channels
+                if cat == 0: #CHANNELS: BGR [0,1,2]
+                    result[row,col,2] = 0 #[Ferrite]
+                    result[row,col,1] = 0
+                    result[row,col,0] = 0
+                elif cat == 1:
+                    result[row,col,0] = 255 #[R.Austenite]
+                elif cat == 2:
+                    result[row,col,2] = 255 #[Pearlite]
+                else:
+                    result[row,col,1] = 255 #[Martensite]
+        mask_filename = 'mask_' + os.path.splitext(filename)[0] + '.png'
+        mask_path = os.path.join(output_folder, mask_filename)
+        cv2.imwrite(mask_path, result)
+
+def smooth_predict():
+    '''Makes a smooth prediction from overlapping patches
+    using the code from Bnsreenu:-
+    https://github.com/bnsreenu/python_for_microscopists/blob/master/229_smooth_predictions_by_blending_patches/smooth_tiled_predictions.py
+    based on Vooban's original code:-
+    https://github.com/Vooban/Smoothly-Blend-Image-Patches/blob/master/smooth_tiled_predictions.py
+    '''
+    input_folder_train = 'C:/' #Not training patches, rather the original large images folder including both train and test imgs, name is a misnomer
+    output_folder = 'C:/'
+    model = load_model('C:/', compile=False) #import .hdf5 file
+    if not os.path.exists(output_folder): 
+        os.makedirs(output_folder)
+    i = 0
+    file_list_train = os.listdir(input_folder_train)
+    for i, filename in tqdm(enumerate(file_list_train), total=len(file_list_train)):
+        filename = file_list_train[i]
+        img_path = input_folder_train + filename
+        img = imread(img_path, 0)[:,:None]
+        img = np.array(img)
+        print(img)
+        img = np.expand_dims(img, axis=0)
+        img = np.expand_dims(img, axis=3)
+        # img = img/255
+        img = (img*0.008)-1
+        img = img.reshape(1, 1152, 1920, 3) #large image size
+        img = np.squeeze(img)
+        print(img)
+        prediction = predict_img_with_smooth_windowing(img, window_size=128, subdivisions=2, nb_classes=4,pred_func=(lambda img_batch_subdiv: model.predict((img_batch_subdiv))))
+        prediction = np.argmax(prediction, axis=2)
+        result = np.zeros((1152,1920,3), dtype=np.uint8)
+        row,col = 1,1
+        for row in range(1152):
+            for col in range(1920):
+                cat = prediction[row, col] 
+                if cat == 0: #CHANNELS: BGR [0,1,2]
+                    result[row,col,2] = 0 #[Ferrite]
+                    result[row,col,1] = 0
+                    result[row,col,0] = 0
+                elif cat == 1:
+                    result[row,col,0] = 255 #[R.Austenite]
+                elif cat == 2:
+                    result[row,col,2] = 255 #[Pearlite]
+                else:
+                    result[row,col,1] = 255 #[Martensite]
+        mask_filename = 'mask_' + os.path.splitext(filename)[0] + '.png'
+        mask_path = os.path.join(output_folder, mask_filename)
+        cv2.imwrite(mask_path, result)
+
+
+def model_iou():
+    '''Determines the model's IoU scores per class
+    '''
+    model = load_model('C:/', compile=False) #import .hdf5 file
+    intersection = [0] * NUM_CLASSES
+    union = [0] * NUM_CLASSES
+
+    for i in range(len(X_test)-1):
+        input_data = np.expand_dims(X_test[i], 0)
+        prediction = model.predict(input_data)
+        prediction = np.argmax(prediction, axis=3)
+        ground_truth = np.argmax(y_test[i], axis=2)
+
+        for class_idx in range(NUM_CLASSES):
+            class_pred = prediction == class_idx
+            class_true = ground_truth == class_idx
+            intersection[class_idx] += np.logical_and(class_pred, class_true).sum()
+            union[class_idx] += np.logical_or(class_pred, class_true).sum()
+
+    iou = [intersection[i] / union[i] if union[i] != 0 else 0 for i in range(NUM_CLASSES)]
+    
+    for class_idx, iou_value in enumerate(iou):
+        print("IoU for Class {}: {}".format(class_idx, iou_value))
+
+
+def model_f1_score():
+    '''Determines the model's F1 scores per class
+    '''
+    model = load_model('C:/', compile=False) #import .hdf5 file
+    true_positive = [0] * NUM_CLASSES
+    false_positive = [0] * NUM_CLASSES
+    false_negative = [0] * NUM_CLASSES
+
+    for i in range(len(X_train)-1):
+        input_data = np.expand_dims(X_train[i], 0)
+        prediction = model.predict(input_data)
+        prediction = np.argmax(prediction, axis=3).squeeze()  # Added squeeze to remove extra dimension
+        ground_truth = np.argmax(y_train[i], axis=2)
+
+        for class_idx in range(NUM_CLASSES):
+            class_pred = prediction == class_idx
+            class_true = ground_truth == class_idx
+            true_positive[class_idx] += np.logical_and(class_pred, class_true).sum()
+            false_positive[class_idx] += np.logical_and(class_pred, np.logical_not(class_true)).sum()
+            false_negative[class_idx] += np.logical_and(np.logical_not(class_pred), class_true).sum()
+
+    precision = [true_positive[i] / (true_positive[i] + false_positive[i]) if (true_positive[i] + false_positive[i]) != 0 else 0 for i in range(NUM_CLASSES)]
+    recall = [true_positive[i] / (true_positive[i] + false_negative[i]) if (true_positive[i] + false_negative[i]) != 0 else 0 for i in range(NUM_CLASSES)]
+    f1_score = [2 * (precision[i] * recall[i]) / (precision[i] + recall[i]) if (precision[i] + recall[i]) != 0 else 0 for i in range(NUM_CLASSES)]
+    
+    for class_idx, f1_value in enumerate(f1_score):
+        print("F1 Score for Class {}: {}".format(class_idx, f1_value))
+
+def print_confusion_matrix():
+    '''Prints the confusion matrix for the model
+    '''
+    model = load_model('C:/', compile=False) #import .hdf5 file
+
+    # Placeholder for ground truth and predictions
+    y_true = []
+    y_pred = []
+
+    for i in range(len(X_test)):
+        input_data = np.expand_dims(X_test[i], 0)
+        prediction = model.predict(input_data)
+        prediction = np.argmax(prediction, axis=3).flatten()
+        ground_truth = np.argmax(y_test[i], axis=2).flatten()
+
+        y_true.extend(ground_truth)
+        y_pred.extend(prediction)
+
+    # Calculate and print confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+    print("Confusion Matrix:")
+    print(cm)
